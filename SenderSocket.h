@@ -29,6 +29,7 @@
 #define SYN_MAX_ATTEMPTS   3
 #define OTHER_MAX_ATTEMPTS 5
 #define DEFAULT_RTO        1.0
+#define MAX_ATTEMPTS 50
 
 #pragma pack(push, 1)
 
@@ -72,6 +73,15 @@ public:
 
 #pragma pack(pop)
 
+class Packet {
+public:
+    int    type;
+    int    size;
+    int    attempts;
+    std::chrono::steady_clock::time_point txTime;
+    char   pkt[MAX_PKT_SIZE];
+};
+
 class SenderSocket {
 public:
     SenderSocket();
@@ -113,9 +123,26 @@ private:
     DWORD finalChecksum;
     
     std::chrono::steady_clock::time_point t0;
-    std::chrono::steady_clock::time_point tFirstData;
-    std::chrono::steady_clock::time_point tLastData;
 
     HANDLE hStatsThread;
     HANDLE hStopEvent;
+
+    // pipeline state
+    Packet* pending;                 // circular buffer, senderWnd slots
+    HANDLE  empty, full;             // semaphores
+    HANDLE  eventQuit;               // tells worker + Send() to stop
+    HANDLE  socketReceiveReady;      // WSAEventSelect event (auto-reset)
+    HANDLE  hWorkerThread;
+
+    DWORD   sndBase;                 // worker-only (stats reads atomic baseSeq)
+    DWORD   nextToSend;              // worker-only
+    DWORD   lastReleased;            // flow-control bookkeeping
+    int     dupAckCount;
+    double  timerExpire;
+
+    std::atomic<int> failStatus;     // nonzero => worker gave up
+    std::chrono::steady_clock::time_point tStart, tEnd;
+
+    static DWORD WINAPI WorkerThreadEntry(LPVOID param);
+    void WorkerRun();
 };

@@ -3,27 +3,53 @@
 #include <algorithm>
 
 // initialize socket
-SenderSocket::SenderSocket() : sock(INVALID_SOCKET), connected(false), estRTT(0.0), devRTT(0.0), RTO(DEFAULT_RTO), baseSeq(0), nextSeq(0), numTimeouts(0), numFastRetx(0), senderWnd(1), effWnd(1), finalChecksum(0), hStatsThread(NULL), hStopEvent(NULL) {
+SenderSocket::SenderSocket(): sock(INVALID_SOCKET), connected(false), estRTT(0.0), devRTT(0.0), RTO(DEFAULT_RTO), baseSeq(0), nextSeq(0), numTimeouts(0), numFastRetx(0), senderWnd(1), effWnd(1), finalChecksum(0),
+    hStatsThread(NULL), hStopEvent(NULL), pending(nullptr), empty(NULL), full(NULL), eventQuit(NULL), socketReceiveReady(NULL), hWorkerThread(NULL), sndBase(0), nextToSend(0), lastReleased(0), dupAckCount(0), timerExpire(0.0), failStatus(0) {
     memset(&server, 0, sizeof(server));
     t0 = std::chrono::steady_clock::now();
 }
 
 SenderSocket::~SenderSocket() {
+    if (eventQuit != NULL) SetEvent(eventQuit);
+    if (hStopEvent != NULL) SetEvent(hStopEvent);
+
+    if (hWorkerThread != NULL) {
+        WaitForSingleObject(hWorkerThread, INFINITE);
+        CloseHandle(hWorkerThread);
+        hWorkerThread = NULL;
+    }
+    if (hStatsThread != NULL) {
+        WaitForSingleObject(hStatsThread, INFINITE);
+        CloseHandle(hStatsThread);
+        hStatsThread = NULL;
+    }
     if (hStopEvent != NULL) {
-        SetEvent(hStopEvent);
-
-        if (hStatsThread != NULL) {
-            WaitForSingleObject(hStatsThread, INFINITE);
-            CloseHandle(hStatsThread);
-            hStatsThread = NULL;
-        }
-
         CloseHandle(hStopEvent);
         hStopEvent = NULL;
-    } if (sock != INVALID_SOCKET) {
+    }
+    if (eventQuit != NULL) {
+        CloseHandle(eventQuit);
+        eventQuit = NULL;
+    }
+    if (socketReceiveReady != NULL) {
+        CloseHandle(socketReceiveReady);
+        socketReceiveReady = NULL; 
+    }
+    if (empty != NULL) {
+        CloseHandle(empty);
+        empty = NULL;
+    }
+    if (full != NULL) {
+        CloseHandle(full);
+        full = NULL; 
+    }
+    if (sock != INVALID_SOCKET) {
         closesocket(sock);
         sock = INVALID_SOCKET;
     }
+
+    delete[] pending;
+    pending = nullptr;
 }
 
 // if program exits prematurely
@@ -81,6 +107,18 @@ void SenderSocket::StatsWorker() {
     }
 }
 
+DWORD WINAPI SenderSocket::WorkerThreadEntry(LPVOID param) {
+    SenderSocket* ss = (SenderSocket*)param;
+    ss->WorkerRun();
+    return 0;
+}
+
+void SenderSocket::WorkerRun() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    // DOOOO real loop comes next
+    WaitForSingleObject(eventQuit, INFINITE);
+}
+
 int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkProperties* lp) {
     if (connected) return ALREADY_CONNECTED;
     senderWnd = senderWindow;
@@ -120,7 +158,7 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
     RTO = max(1.0, 2.0 * (double)lp->RTT);
 
     // router buffer
-    lp->bufferSize = senderWindow + OTHER_MAX_ATTEMPTS;
+    lp->bufferSize = senderWindow + MAX_ATTEMPTS;
     SenderSynHeader ssh;
     ssh.sdh.flags.SYN = 1;
     ssh.sdh.seq = 0;
@@ -146,15 +184,38 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
     RTO = estRTT + 4.0 * max(devRTT, 0.010);
     effWnd = min(senderWnd, (int)rh.recvWnd);
 
+    // bigger kernel buffers
+    int kb = 20000000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&kb, sizeof(kb));
+    kb = 20000000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&kb, sizeof(kb));
+
+    // pipeline state
+    pending = new Packet[senderWnd];
+    eventQuit = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
+    socketReceiveReady = CreateEvent(NULL, FALSE, FALSE, NULL); // auto-reset
+    WSAEventSelect(sock, socketReceiveReady, FD_READ);
+
+    empty = CreateSemaphore(NULL, 0, senderWnd, NULL);
+    full = CreateSemaphore(NULL, 0, senderWnd, NULL);
+    lastReleased = effWnd;
+    ReleaseSemaphore(empty, effWnd, NULL);
+
     baseSeq = 0;
     nextSeq = 0;
+    sndBase = 0;
+    nextToSend = 0;
+    dupAckCount = 0;
+    timerExpire = 0.0;
     numTimeouts = 0;
     numFastRetx = 0;
+    failStatus = 0;
     connected = true;
+    tStart = std::chrono::steady_clock::now();
 
-    // starts 2-sec stats worker thread
     hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     hStatsThread = CreateThread(NULL, 0, StatsThreadEntry, this, 0, NULL);
+    hWorkerThread = CreateThread(NULL, 0, WorkerThreadEntry, this, 0, NULL);
 
     return STATUS_OK;
 }
@@ -162,65 +223,69 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
 int SenderSocket::Send(const char* buf, int bytes) {
     if (!connected) return NOT_CONNECTED;
 
-    char pkt[MAX_PKT_SIZE];
-    memset(pkt, 0, sizeof(SenderDataHeader));
+    HANDLE arr[] = { eventQuit, empty };
+    DWORD r = WaitForMultipleObjects(2, arr, FALSE, INFINITE);
+    
+    if (r == WAIT_OBJECT_0) {
+        int fs = failStatus.load();
+        return fs != 0 ? fs : NOT_CONNECTED;
+    }
 
-    SenderDataHeader* sdh = (SenderDataHeader*)pkt;
-    sdh->flags.magic = MAGIC_PROTOCOL;
-    sdh->flags.SYN = 0;
-    sdh->flags.ACK = 0;
-    sdh->flags.FIN = 0;
-    sdh->flags.reserved = 0;
-    sdh->seq = nextSeq.load();
+    DWORD seq = nextSeq.load();
+    Packet* p = &pending[seq % senderWnd];
+
+    SenderDataHeader* sdh = (SenderDataHeader*)p->pkt;
+    sdh->flags = Flags();
+    sdh->seq = seq;
+    memcpy(sdh + 1, buf, bytes);
+
+    p->type = 0;
+    p->size = (int)sizeof(SenderDataHeader) + bytes;
+    p->attempts = 0;
 
     nextSeq++;
-    memcpy(pkt + sizeof(SenderDataHeader), buf, bytes);
-    int pktLen = (int)(sizeof(SenderDataHeader) + bytes);
-
-    if (sdh->seq == 0) tFirstData = std::chrono::steady_clock::now();
-
-    ReceiverHeader rh;
-    double rttSample = 0;
-    int status = SendAndWait("data", sdh->seq, pkt, pktLen, OTHER_MAX_ATTEMPTS, false, false, rh, rttSample);
-    if (status != STATUS_OK) return status;
-
-    effWnd = min(senderWnd, (int)rh.recvWnd);
-    baseSeq = rh.ackSeq;
-    tLastData = std::chrono::steady_clock::now();
-
+    ReleaseSemaphore(full, 1, NULL);
     return STATUS_OK;
 }
 
 int SenderSocket::Close(double* elapsedTime) {
     if (!connected) return NOT_CONNECTED;
-    if (hStopEvent != NULL) {
-        SetEvent(hStopEvent);
 
-        if (hStatsThread != NULL) {
-            WaitForSingleObject(hStatsThread, INFINITE);
-            CloseHandle(hStatsThread);
-            hStatsThread = NULL;
-        }
-
-        CloseHandle(hStopEvent);
-        hStopEvent = NULL;
+    // wait until every data packet is ACKed
+    while (baseSeq.load() < nextSeq.load()) {
+        int fs = failStatus.load();
+        if (fs != 0) return fs;
+        Sleep(1);
     }
+    tEnd = std::chrono::steady_clock::now();
 
+    // stop worker and stats
+    SetEvent(eventQuit);
+    WaitForSingleObject(hWorkerThread, INFINITE);
+    CloseHandle(hWorkerThread);
+    hWorkerThread = NULL;
+
+    SetEvent(hStopEvent);
+    WaitForSingleObject(hStatsThread, INFINITE);
+    CloseHandle(hStatsThread);
+    hStatsThread = NULL;
+
+    // FIN
     DWORD finSeq = nextSeq.load();
     SenderDataHeader sdh;
-    sdh.flags.magic = MAGIC_PROTOCOL;
     sdh.flags.FIN = 1;
     sdh.seq = finSeq;
 
     ReceiverHeader rh;
     double rttSample = 0;
-    int status = SendAndWait("FIN", finSeq, (const char*)&sdh, sizeof(sdh), OTHER_MAX_ATTEMPTS, false, true, rh, rttSample);
+    int status = SendAndWait("FIN", finSeq, (const char*)&sdh, sizeof(sdh), MAX_ATTEMPTS, false, true, rh, rttSample);
+    
     if (status != STATUS_OK) return status;
 
     finalChecksum = rh.recvWnd;
     printf("[%5.2f] <-- FIN-ACK %d window %X\n", Now(), rh.ackSeq, finalChecksum);
 
-    if (elapsedTime != nullptr) *elapsedTime = std::chrono::duration<double>(tLastData - tFirstData).count();
+    if (elapsedTime != nullptr) *elapsedTime = std::chrono::duration<double>(tEnd - tStart).count();
 
     connected = false;
     closesocket(sock);
