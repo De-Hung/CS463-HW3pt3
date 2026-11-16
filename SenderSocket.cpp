@@ -1,6 +1,7 @@
 #include "SenderSocket.h"
 #include <stdio.h>
 #include <algorithm>
+#include <cmath>
 
 // initialize socket
 SenderSocket::SenderSocket(): sock(INVALID_SOCKET), connected(false), estRTT(0.0), devRTT(0.0), RTO(DEFAULT_RTO), baseSeq(0), nextSeq(0), numTimeouts(0), numFastRetx(0), senderWnd(1), effWnd(1), finalChecksum(0),
@@ -115,8 +116,95 @@ DWORD WINAPI SenderSocket::WorkerThreadEntry(LPVOID param) {
 
 void SenderSocket::WorkerRun() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    // DOOOO real loop comes next
-    WaitForSingleObject(eventQuit, INFINITE);
+    HANDLE events[] = { eventQuit, socketReceiveReady, full };
+
+    auto transmit = [&](DWORD seq) -> bool {
+        Packet* p = &pending[seq % senderWnd];
+        if (p->attempts >= MAX_ATTEMPTS) return false;
+        sendto(sock, p->pkt, p->size, 0, (struct sockaddr*)&server, sizeof(server));
+        p->attempts++;
+        p->txTime = std::chrono::steady_clock::now();
+        return true;
+     };
+
+    auto fail = [&](int code) {
+        failStatus = code;
+        SetEvent(eventQuit);
+    };
+
+    while (true) {
+        DWORD timeoutMs = INFINITE;
+        if (sndBase < nextToSend) {
+            double rem = timerExpire - Now();
+            timeoutMs = rem > 0 ? (DWORD)ceil(rem * 1000.0) : 0;
+        }
+
+        DWORD ret = WaitForMultipleObjects(3, events, FALSE, timeoutMs);
+
+        if (ret == WAIT_OBJECT_0) {
+            return;
+        } else if (ret == WAIT_TIMEOUT) {
+            if (!transmit(sndBase)) { fail(TIMEOUT); return; }
+            numTimeouts++;
+            dupAckCount = 0;
+            timerExpire = Now() + RTO;
+        } else if (ret == WAIT_OBJECT_0 + 1) {
+            while (true) {
+                ReceiverHeader rh;
+                struct sockaddr_in from;
+                int fromLen = sizeof(from);
+                int n = recvfrom(sock, (char*)&rh, sizeof(rh), 0, (struct sockaddr*)&from, &fromLen);
+                if (n == SOCKET_ERROR) {
+                    if (WSAGetLastError() == WSAEWOULDBLOCK) break;
+                    fail(FAILED_RECV);
+                    return;
+                }
+                if (n != sizeof(ReceiverHeader)) continue;
+                if (rh.flags.magic != MAGIC_PROTOCOL || !rh.flags.ACK) continue;
+
+                DWORD y = rh.ackSeq;
+
+                if (y > sndBase && y <= nextToSend) {
+                    if (pending[sndBase % senderWnd].attempts == 1) {
+                        Packet* last = &pending[(y - 1) % senderWnd];
+                        double sample = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - last->txTime).count();
+                        UpdateRTO(sample);
+                    }
+
+                    sndBase = y;
+                    baseSeq = y;
+                    dupAckCount = 0;
+
+                    // flow control
+                    effWnd = min(senderWnd, (int)rh.recvWnd);
+                    int newReleased = (int)(sndBase + effWnd - lastReleased);
+                    if (newReleased > 0) {
+                        ReleaseSemaphore(empty, newReleased, NULL);
+                        lastReleased += newReleased;
+                    }
+
+                    timerExpire = Now() + RTO; // window moved: restart timer
+                } else if (y == sndBase && sndBase < nextToSend) {
+                    dupAckCount++;
+
+                    if (dupAckCount == 3) {
+                        if (!transmit(sndBase)) { fail(TIMEOUT); return; }
+                        numFastRetx++;
+                        timerExpire = Now() + RTO;
+                    }
+                }
+            }
+        } else if (ret == WAIT_OBJECT_0 + 2) {
+            bool windowWasEmpty = (sndBase == nextToSend);
+            transmit(nextToSend);
+            if (windowWasEmpty) timerExpire = Now() + RTO;
+            nextToSend++;
+        } else {
+            fail(FAILED_RECV);
+            return;
+        }
+    }
 }
 
 int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkProperties* lp) {
