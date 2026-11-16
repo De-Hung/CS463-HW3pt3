@@ -192,8 +192,8 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
 
     // pipeline state
     pending = new Packet[senderWnd];
-    eventQuit = CreateEvent(NULL, TRUE, FALSE, NULL); // manual-reset
-    socketReceiveReady = CreateEvent(NULL, FALSE, FALSE, NULL); // auto-reset
+    eventQuit = CreateEvent(NULL, TRUE, FALSE, NULL); // manual reset
+    socketReceiveReady = CreateEvent(NULL, FALSE, FALSE, NULL); // auto reset
     WSAEventSelect(sock, socketReceiveReady, FD_READ);
 
     empty = CreateSemaphore(NULL, 0, senderWnd, NULL);
@@ -331,7 +331,7 @@ int SenderSocket::SendAndWait(const char* name, DWORD seq, const char* pkt, int 
                 if (rh.flags.FIN) return STATUS_OK;
             } else {
                 if (rh.ackSeq == seq + 1) {
-                    if (attempt == 1) {   // Karn's rule: only sample non-retransmitted packets
+                    if (attempt == 1) {
                         rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
                         UpdateRTO(rttSample);
                     }
