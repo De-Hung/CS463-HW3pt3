@@ -6,7 +6,7 @@
 
 // if params are incorrect
 static void Usage() {
-    printf("Must be in Usage format: hw3p2.exe <host> <power> <senderWindow> <RTT> <lossFwd> <lossRet> <speedMbps>\n");
+    printf("Must be in Usage format: hw3p3.exe <host> <power> <senderWindow> <RTT> <lossFwd> <lossRet> <speedMbps>\n");
 }
 
 int main(int argc, char** argv) {
@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
         off += bytes;
     }
 
-    // transfer time = returning from Open() - calling Close()
+    // transfer time 
     double transferTime = 0;
     if ((status = ss.Close(&transferTime)) != STATUS_OK) {
         printf("Main:\tclose failed with status %d\n", status);
@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
 
     // ideal rate
     int payloadBits = (MAX_PKT_SIZE - sizeof(SenderDataHeader)) * 8;
-    double idealRateKbps = (ss.GetEstRTT() > 0) ? ((double)ss.GetEffectiveWindow() * payloadBits) / (ss.GetEstRTT() * 1000.0) : 0.0;
+    double idealRateKbps = (ss.GetEstRTT() > 0) ? ((double)senderWindow * payloadBits) / (ss.GetEstRTT() * 1000.0) : 0.0;
     printf("Main:\testRTT %.3f, ideal rate %.2f Kbps\n", ss.GetEstRTT(), idealRateKbps);
 
     // clean up
