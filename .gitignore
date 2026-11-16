@@ -1,0 +1,33 @@
+# Visual Studio state
+.vs/
+*.user
+*.suo
+*.vcxproj.user
+*.aps
+*.ncb
+*.sdf
+*.VC.db
+*.VC.VC.opendb
+
+# Build output
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]in/
+[Oo]bj/
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.lib
+*.exp
+*.log
+*.tlog
+*.ipch
+
+# Test traces and large data (keep your report outputs out of the repo)
+*.trace
+*.csv
