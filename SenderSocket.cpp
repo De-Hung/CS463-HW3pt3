@@ -7,6 +7,11 @@
 SenderSocket::SenderSocket(): sock(INVALID_SOCKET), connected(false), estRTT(0.0), devRTT(0.0), RTO(DEFAULT_RTO), baseSeq(0), nextSeq(0), numTimeouts(0), numFastRetx(0), senderWnd(1), effWnd(1), finalChecksum(0),
     hStatsThread(NULL), hStopEvent(NULL), pending(nullptr), empty(NULL), full(NULL), eventQuit(NULL), socketReceiveReady(NULL), hWorkerThread(NULL), sndBase(0), nextToSend(0), lastReleased(0), dupAckCount(0), timerExpire(0.0), failStatus(0) {
     memset(&server, 0, sizeof(server));
+    timerActive = false; 
+    timerKick = NULL;
+    hSender[0] = hSender[1] = NULL;
+    sentCount[0] = 0; sentCount[1] = 0;
+
     t0 = std::chrono::steady_clock::now();
 }
 
@@ -15,9 +20,11 @@ SenderSocket::~SenderSocket() {
     if (hStopEvent != NULL) SetEvent(hStopEvent);
 
     if (hWorkerThread != NULL) {
-        WaitForSingleObject(hWorkerThread, INFINITE);
-        CloseHandle(hWorkerThread);
-        hWorkerThread = NULL;
+        HANDLE hs[3] = { hWorkerThread, hSender[0], hSender[1] };
+        for (int i = 0; i < 3; i++) if (hs[i] != NULL) { WaitForSingleObject(hs[i], INFINITE); CloseHandle(hs[i]); }
+        hWorkerThread = NULL; 
+        hSender[0] = hSender[1] = NULL;
+        if (timerKick != NULL) CloseHandle(timerKick); timerKick = NULL;
     }
     if (hStatsThread != NULL) {
         WaitForSingleObject(hStatsThread, INFINITE);
@@ -116,7 +123,7 @@ DWORD WINAPI SenderSocket::WorkerThreadEntry(LPVOID param) {
 
 void SenderSocket::WorkerRun() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    HANDLE events[] = { eventQuit, socketReceiveReady, full };
+    HANDLE events[] = { eventQuit, socketReceiveReady, timerKick };
 
     auto transmit = [&](DWORD seq) -> bool {
         Packet* p = &pending[seq % senderWnd];
@@ -125,85 +132,116 @@ void SenderSocket::WorkerRun() {
         p->attempts++;
         p->txTime = std::chrono::steady_clock::now();
         return true;
-     };
-
-    auto fail = [&](int code) {
-        failStatus = code;
-        SetEvent(eventQuit);
+    };
+    auto fail = [&](int code) { 
+        failStatus = code; 
+        SetEvent(eventQuit); 
     };
 
     while (true) {
         DWORD timeoutMs = INFINITE;
-        if (sndBase < nextToSend) {
-            double rem = timerExpire - Now();
-            timeoutMs = rem > 0 ? (DWORD)ceil(rem * 1000.0) : 0;
+        {
+            std::lock_guard<std::mutex> lk(stateMtx);
+            if (timerActive) {
+                double rem = timerExpire - Now();
+                timeoutMs = rem > 0 ? (DWORD)ceil(rem * 1000.0) : 0;
+            }
         }
-
         DWORD ret = WaitForMultipleObjects(3, events, FALSE, timeoutMs);
 
-        if (ret == WAIT_OBJECT_0) {
-            return;
-        } else if (ret == WAIT_TIMEOUT) {
-            if (!transmit(sndBase)) { fail(TIMEOUT); return; }
+        if (ret == WAIT_OBJECT_0) return;
+        else if (ret == WAIT_TIMEOUT) {
+            std::lock_guard<std::mutex> lk(stateMtx);
+            if (!timerActive || Now() < timerExpire) continue;
+            if (!transmit(sndBase)) { 
+                fail(TIMEOUT); 
+                return; 
+            }
             numTimeouts++;
             dupAckCount = 0;
             timerExpire = Now() + RTO;
-        } else if (ret == WAIT_OBJECT_0 + 1) {
+        }
+        else if (ret == WAIT_OBJECT_0 + 1) {
             while (true) {
                 ReceiverHeader rh;
-                struct sockaddr_in from;
-                int fromLen = sizeof(from);
+                struct sockaddr_in from; int fromLen = sizeof(from);
                 int n = recvfrom(sock, (char*)&rh, sizeof(rh), 0, (struct sockaddr*)&from, &fromLen);
                 if (n == SOCKET_ERROR) {
                     if (WSAGetLastError() == WSAEWOULDBLOCK) break;
-                    fail(FAILED_RECV);
-                    return;
+                    fail(FAILED_RECV); return;
                 }
                 if (n != sizeof(ReceiverHeader)) continue;
                 if (rh.flags.magic != MAGIC_PROTOCOL || !rh.flags.ACK) continue;
 
                 DWORD y = rh.ackSeq;
+                std::lock_guard<std::mutex> lk(stateMtx);
+                DWORD nts = nextToSend.load();
 
-                if (y > sndBase && y <= nextToSend) {
+                if (y > sndBase && y <= nts) {
                     if (pending[sndBase % senderWnd].attempts == 1) {
                         Packet* last = &pending[(y - 1) % senderWnd];
-                        double sample = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - last->txTime).count();
+                        double sample = std::chrono::duration<double>(std::chrono::steady_clock::now() - last->txTime).count();
                         UpdateRTO(sample);
                     }
-
                     sndBase = y;
                     baseSeq = y;
                     dupAckCount = 0;
 
-                    // flow control
                     effWnd = min(senderWnd, (int)rh.recvWnd);
                     int newReleased = (int)(sndBase + effWnd - lastReleased);
                     if (newReleased > 0) {
                         ReleaseSemaphore(empty, newReleased, NULL);
                         lastReleased += newReleased;
                     }
-
-                    timerExpire = Now() + RTO; // window moved: restart timer
-                } else if (y == sndBase && sndBase < nextToSend) {
+                    timerActive = (y < nts);
+                    if (timerActive) timerExpire = Now() + RTO;
+                } else if (y == sndBase && sndBase < nts) {
                     dupAckCount++;
 
                     if (dupAckCount == 3) {
-                        if (!transmit(sndBase)) { fail(TIMEOUT); return; }
+                        if (!transmit(sndBase)) {
+                            fail(TIMEOUT); 
+                            return; 
+                        }
                         numFastRetx++;
                         timerExpire = Now() + RTO;
                     }
                 }
             }
-        } else if (ret == WAIT_OBJECT_0 + 2) {
-            bool windowWasEmpty = (sndBase == nextToSend);
-            transmit(nextToSend);
-            if (windowWasEmpty) timerExpire = Now() + RTO;
-            nextToSend++;
-        } else {
-            fail(FAILED_RECV);
-            return;
         }
+    }
+}
+
+DWORD WINAPI SenderSocket::SenderThreadEntry(LPVOID param) {
+    SenderArg* a = (SenderArg*)param;
+    a->ss->SenderRun(a->id);
+    return 0;
+}
+
+void SenderSocket::SenderRun(int id) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    HANDLE ev[] = { eventQuit, full };
+    while (true) {
+        DWORD r = WaitForMultipleObjects(2, ev, FALSE, INFINITE);
+        if (r == WAIT_OBJECT_0) return;
+
+        DWORD seq = nextToSend.fetch_add(1);
+        Packet* p = &pending[seq % senderWnd];
+        p->txTime = std::chrono::steady_clock::now();
+        p->attempts++;
+        sendto(sock, p->pkt, p->size, 0, (struct sockaddr*)&server, sizeof(server));
+        sentCount[id]++;
+
+        bool kick = false;
+        {
+            std::lock_guard<std::mutex> lk(stateMtx);
+            if (seq == sndBase && !timerActive) {
+                timerActive = true;
+                timerExpire = Now() + RTO;
+                kick = true;
+            }
+        }
+        if (kick) SetEvent(timerKick);
     }
 }
 
@@ -282,6 +320,7 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
     pending = new Packet[senderWnd];
     eventQuit = CreateEvent(NULL, TRUE, FALSE, NULL); // manual reset
     socketReceiveReady = CreateEvent(NULL, FALSE, FALSE, NULL); // auto reset
+    timerKick = CreateEvent(NULL, FALSE, FALSE, NULL); // auto reset
     WSAEventSelect(sock, socketReceiveReady, FD_READ);
 
     empty = CreateSemaphore(NULL, 0, senderWnd, NULL);
@@ -304,6 +343,10 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
     hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     hStatsThread = CreateThread(NULL, 0, StatsThreadEntry, this, 0, NULL);
     hWorkerThread = CreateThread(NULL, 0, WorkerThreadEntry, this, 0, NULL);
+    for (int i = 0; i < 2; i++) {
+        senderArgs[i].ss = this; senderArgs[i].id = i;
+        hSender[i] = CreateThread(NULL, 0, SenderThreadEntry, &senderArgs[i], 0, NULL);
+    }
 
     return STATUS_OK;
 }
@@ -349,9 +392,11 @@ int SenderSocket::Close(double* elapsedTime) {
 
     // stop worker and stats
     SetEvent(eventQuit);
-    WaitForSingleObject(hWorkerThread, INFINITE);
-    CloseHandle(hWorkerThread);
-    hWorkerThread = NULL;
+    HANDLE hs[3] = { hWorkerThread, hSender[0], hSender[1] };
+    WaitForMultipleObjects(3, hs, TRUE, INFINITE);
+    for (int i = 0; i < 3; i++) CloseHandle(hs[i]);
+    hWorkerThread = NULL; hSender[0] = hSender[1] = NULL;
+    printf("Load: sender0 %ld pkts, sender1 %ld pkts\n", sentCount[0].load(), sentCount[1].load());
 
     SetEvent(hStopEvent);
     WaitForSingleObject(hStatsThread, INFINITE);

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -134,9 +135,9 @@ private:
     HANDLE  socketReceiveReady;      // WSAEventSelect event (auto-reset)
     HANDLE  hWorkerThread;
 
-    DWORD   sndBase;                 // worker-only (stats reads atomic baseSeq)
-    DWORD   nextToSend;              // worker-only
-    DWORD   lastReleased;            // flow-control bookkeeping
+    DWORD   sndBase;                 // worker-only
+    std::atomic<DWORD> nextToSend;   // worker-only
+    DWORD   lastReleased;            // flow-control bookkeeping`
     int     dupAckCount;
     double  timerExpire;
 
@@ -145,4 +146,14 @@ private:
 
     static DWORD WINAPI WorkerThreadEntry(LPVOID param);
     void WorkerRun();
+
+    std::mutex stateMtx;                 // protects counts
+    bool    timerActive;
+    HANDLE  timerKick;                   // wakes control thread when sender starts timer
+    HANDLE  hSender[2];
+    struct SenderArg { SenderSocket* ss; int id; };
+    SenderArg senderArgs[2];
+    std::atomic<long> sentCount[2];      // packets sent by senders
+    static DWORD WINAPI SenderThreadEntry(LPVOID param);
+    void SenderRun(int id);
 };
