@@ -414,10 +414,7 @@ int SenderSocket::Close(double* elapsedTime) {
     int status = SendAndWait("FIN", finSeq, (const char*)&sdh, sizeof(sdh), MAX_ATTEMPTS, false, true, rh, rttSample);
     
     if (status != STATUS_OK) return status;
-
     finalChecksum = rh.recvWnd;
-    printf("[%5.2f] <-- FIN-ACK %d window %X\n", Now(), rh.ackSeq, finalChecksum);
-
     if (elapsedTime != nullptr) *elapsedTime = std::chrono::duration<double>(tEnd - tStart).count();
 
     connected = false;
